@@ -84,56 +84,57 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
             self._create_mock_event(query_return=False),
         ]
         self.mock_device_module.Event.side_effect = events
+        # Capacity for a single resident adapter: admission of "new_lora" only
+        # succeeds if the completed "stale_lora" event is drained first.
         self.mock_lora_manager.validate_lora_batch.side_effect = (
             lambda lora_ids: len(lora_ids) <= 1
         )
 
-        self.assertTrue(
-            loader._try_start_overlap_load("stale_lora", running_loras=set())
-        )
+        # Seed an in-flight load with a completed event.
+        loader.new_overlap_loads_lora({"stale_lora"})
         self.assertIn("stale_lora", loader.lora_to_overlap_load_event)
 
         self.mock_lora_manager.fetch_new_loras.reset_mock()
-        result = loader.try_overlap_load_lora("new_lora", running_loras=set())
+        # Admission drains the completed stale event first, freeing the capacity
+        # gate so the new adapter can be admitted.
+        result = loader.try_admit_overlap_lora("new_lora", running_loras=set())
 
-        # With pipelining, returns True as soon as load starts
         self.assertTrue(result)
         self.assertNotIn("stale_lora", loader.lora_to_overlap_load_event)
-        self.assertIn("new_lora", loader.lora_to_overlap_load_event)
-        self.assertIn("new_lora", loader.pipelined_loading_loras)
-        self.mock_lora_manager.fetch_new_loras.assert_called_once_with(
-            {"new_lora"}, set(), loading_stream=self.mock_stream
-        )
+        # Admission is capacity-only; it must not issue a transfer.
+        self.mock_lora_manager.fetch_new_loras.assert_not_called()
 
     def test_loaded_lora_reused_after_stale_event_drain(self):
         loader = self._create_loader()
         self.mock_lora_manager.memory_pool = MagicMock()
         self.mock_lora_manager.memory_pool.uid_to_buffer_id = {}
+        self.mock_lora_manager.fetch_new_loras.side_effect = self._mark_loras_loaded
         events = [
             self._create_mock_event(query_return=True),
             self._create_mock_event(query_return=False),
         ]
         self.mock_device_module.Event.side_effect = events
-        self.mock_lora_manager.validate_lora_batch.side_effect = (
-            lambda lora_ids: len(lora_ids) <= 2
-        )
 
-        self.assertTrue(loader._try_start_overlap_load("lora_A", running_loras=set()))
+        # First batch load leaves lora_A resident with a completed event.
+        loader.new_overlap_loads_lora({"lora_A"})
         self.assertIn("lora_A", loader.lora_to_overlap_load_event)
 
         self.mock_lora_manager.fetch_new_loras.reset_mock()
-        # With pipelining, returns True as soon as load starts
-        self.assertTrue(loader.try_overlap_load_lora("lora_B", running_loras=set()))
-        self.assertNotIn("lora_A", loader.lora_to_overlap_load_event)
+        # Second batch load: lora_A's event drains (via admission) and it stays
+        # resident; only lora_B needs a transfer.
+        self.assertTrue(loader.try_admit_overlap_lora("lora_B", running_loras=set()))
+        loader.new_overlap_loads_lora({"lora_B"})
         self.assertIn("lora_B", loader.lora_to_overlap_load_event)
         self.assertIn("lora_B", loader.pipelined_loading_loras)
-        self.mock_lora_manager.fetch_new_loras.assert_called_once_with(
-            {"lora_B"}, set(), loading_stream=self.mock_stream
+        self.mock_lora_manager.fetch_new_loras.assert_called_once()
+        self.assertEqual(
+            self.mock_lora_manager.fetch_new_loras.call_args[0][0], {"lora_B"}
         )
 
+        # lora_A is already resident, so re-admitting it issues no new transfer.
         self.mock_lora_manager.fetch_new_loras.reset_mock()
-        self.assertTrue(loader.try_overlap_load_lora("lora_A", running_loras=set()))
-        self.assertIn("lora_B", loader.lora_to_overlap_load_event)
+        self.assertTrue(loader.try_admit_overlap_lora("lora_A", running_loras=set()))
+        loader.new_overlap_loads_lora({"lora_A"})
         self.mock_lora_manager.fetch_new_loras.assert_not_called()
 
     def test_pending_lora_load_must_complete_even_if_memory_pool_has_slot(self):
@@ -141,9 +142,11 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         self.mock_lora_manager.memory_pool = MagicMock()
         self.mock_lora_manager.memory_pool.uid_to_buffer_id = {"lora_A": 0}
 
+        # An un-drained (LOADING) event that was never promoted to pipelined:
+        # admission must defer (return False) rather than admit it this tick.
         loader.lora_to_overlap_load_event["lora_A"] = self._create_mock_event(False)
 
-        result = loader.try_overlap_load_lora("lora_A", running_loras=set())
+        result = loader.try_admit_overlap_lora("lora_A", running_loras=set())
 
         self.assertFalse(result)
         self.mock_lora_manager.fetch_new_loras.assert_not_called()
@@ -151,62 +154,61 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
 
     def test_full_lifecycle_single_lora_load(self):
         loader = self._create_loader()
+        self.mock_lora_manager.fetch_new_loras.side_effect = self._mark_loras_loaded
 
-        # Initially not loaded
+        # Initially not loaded.
         status = loader._check_overlap_load_status("lora_A")
         self.assertEqual(status, LoRAOverlapLoadStatus.NOT_LOADED)
 
-        # First call starts async load, returns True immediately (pipelined)
-        result = loader.try_overlap_load_lora("lora_A", running_loras=set())
-        self.assertTrue(result)
+        # Phase 1 admits (capacity only); Phase 2 issues the transfer and marks
+        # the adapter pipelined.
+        self.assertTrue(loader.try_admit_overlap_lora("lora_A", running_loras=set()))
+        self.mock_lora_manager.fetch_new_loras.assert_not_called()
+        loader.new_overlap_loads_lora({"lora_A"})
         self.assertIn("lora_A", loader.lora_to_overlap_load_event)
         self.assertIn("lora_A", loader.pipelined_loading_loras)
-        self.mock_lora_manager.fetch_new_loras.assert_called_once_with(
-            {"lora_A"}, set(), loading_stream=self.mock_stream
-        )
+        self.mock_lora_manager.fetch_new_loras.assert_called_once()
 
-        # While pipelined and still in memory pool, returns True (forward gates on per-layer flags)
-        result = loader.try_overlap_load_lora("lora_A", running_loras=set())
-        self.assertTrue(result)
+        # While pipelined and still resident, re-admission returns True via the
+        # top guard (forward gates on per-layer flags) with no new transfer.
+        self.mock_lora_manager.fetch_new_loras.reset_mock()
+        self.assertTrue(loader.try_admit_overlap_lora("lora_A", running_loras=set()))
+        self.mock_lora_manager.fetch_new_loras.assert_not_called()
 
-        # Even after event completes, pipelined path keeps returning True
-        # as long as adapter remains in memory pool
+        # Even after the event completes, a resident adapter keeps admitting.
         loader.lora_to_overlap_load_event["lora_A"].query.return_value = True
-        result = loader.try_overlap_load_lora("lora_A", running_loras=set())
-        self.assertTrue(result)
+        self.assertTrue(loader.try_admit_overlap_lora("lora_A", running_loras=set()))
+        self.mock_lora_manager.fetch_new_loras.assert_not_called()
 
     def test_capacity_constraints_block_new_loads(self):
         loader = self._create_loader()
+        self.mock_lora_manager.fetch_new_loras.side_effect = self._mark_loras_loaded
 
         events = [self._create_mock_event() for _ in range(4)]
         self.mock_device_module.Event.side_effect = events
 
-        # Load 3 loras successfully
-        for i in range(3):
-            self.assertTrue(
-                loader._try_start_overlap_load(f"lora_{i}", running_loras=set())
-            )
+        # Load 3 loras successfully (one batched transfer).
+        loader.new_overlap_loads_lora({"lora_0", "lora_1", "lora_2"})
         self.assertEqual(len(loader.lora_to_overlap_load_event), 3)
 
-        # Capacity full - new load blocked
+        # Capacity full - admission of a new adapter is blocked.
         self.mock_lora_manager.validate_lora_batch.return_value = False
         self.mock_lora_manager.fetch_new_loras.reset_mock()
-        result = loader.try_overlap_load_lora("lora_3", running_loras=set())
+        result = loader.try_admit_overlap_lora("lora_3", running_loras=set())
         self.assertFalse(result)
         self.mock_lora_manager.fetch_new_loras.assert_not_called()
         self.assertNotIn("lora_3", loader.lora_to_overlap_load_event)
 
-        # First lora completes, freeing capacity
+        # First lora completes, freeing capacity.
         loader.lora_to_overlap_load_event["lora_0"].query.return_value = True
-
         loader._drain_completed_overlap_loads()
         self.assertEqual(
             loader._check_overlap_load_status("lora_0"), LoRAOverlapLoadStatus.LOADED
         )
 
-        # Now new load succeeds
+        # Now admission succeeds again.
         self.mock_lora_manager.validate_lora_batch.return_value = True
-        self.assertTrue(loader._try_start_overlap_load("lora_3", running_loras=set()))
+        self.assertTrue(loader.try_admit_overlap_lora("lora_3", running_loras=set()))
 
     def test_validation_includes_pending_and_running_loras(self):
         loader = self._create_loader()
@@ -214,19 +216,92 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         events = [self._create_mock_event() for _ in range(5)]
         self.mock_device_module.Event.side_effect = events
 
-        # Start pending loads
-        loader._try_start_overlap_load("pending_1", running_loras=set())
-        loader._try_start_overlap_load("pending_2", running_loras=set())
+        # Start pending (in-flight) loads.
+        loader.new_overlap_loads_lora({"pending_1", "pending_2"})
 
-        # Load new lora with running_loras
+        # Admit a new adapter against a set of already-running adapters.
         self.mock_lora_manager.validate_lora_batch.reset_mock()
         running = {"running_1", "running_2"}
-        loader.try_overlap_load_lora("new_lora", running_loras=running)
+        loader.try_admit_overlap_lora("new_lora", running_loras=running)
 
-        # Validation should include: pending + running + new
+        # The capacity check must consider everything that will be resident:
+        # pending (in-flight) + running + the new adapter.
         call_args = self.mock_lora_manager.validate_lora_batch.call_args[0][0]
         expected = {"pending_1", "pending_2", "running_1", "running_2", "new_lora"}
         self.assertEqual(call_args, expected)
+
+    def test_layer_major_admits_set_and_loads_once(self):
+        """Admitting {A, B, C} into one batch (phase 1) issues exactly ONE
+        layer-major `fetch_new_loras({A, B, C})` on flush (phase 2), not one
+        call per adapter — the invariant that lets the memory pool interleave
+        adapters within each layer.
+        """
+        loader = self._create_loader()
+
+        running: set = set()
+        # Phase 1: admit each request; no transfer issued yet.
+        for lora_id in ("lora_A", "lora_B", "lora_C"):
+            self.assertTrue(loader.try_admit_overlap_lora(lora_id, running))
+            running.add(lora_id)
+        self.mock_lora_manager.fetch_new_loras.assert_not_called()
+        self.assertEqual(len(loader.lora_to_overlap_load_event), 0)
+
+        # one flush issues a single set-based load.
+        loader.new_overlap_loads_lora({"lora_A", "lora_B", "lora_C"})
+
+        self.mock_lora_manager.fetch_new_loras.assert_called_once()
+        new_loras_arg = self.mock_lora_manager.fetch_new_loras.call_args[0][0]
+        self.assertEqual(new_loras_arg, {"lora_A", "lora_B", "lora_C"})
+        self.assertEqual(
+            self.mock_lora_manager.fetch_new_loras.call_args.kwargs["loading_stream"],
+            self.mock_stream,
+        )
+        # All three are now tracked as pipelined and share one completion event.
+        for lora_id in ("lora_A", "lora_B", "lora_C"):
+            self.assertIn(lora_id, loader.pipelined_loading_loras)
+            self.assertIn(lora_id, loader.lora_to_overlap_load_event)
+        events = {id(e) for e in loader.lora_to_overlap_load_event.values()}
+        self.assertEqual(len(events), 1)
+
+        # A second flush for the same (now resident) set is a no-op.
+        self.mock_lora_manager.fetch_new_loras.reset_mock()
+        loader.new_overlap_loads_lora({"lora_A", "lora_B", "lora_C"})
+        self.mock_lora_manager.fetch_new_loras.assert_not_called()
+
+    def test_partial_admission_on_capacity(self):
+        """With capacity for 2, admitting {A, B, C} admits two and rejects the
+        third with NO side effects — no transfer, no event/flag mutation for
+        the rejected adapter, and flush loads only the admitted subset.
+        """
+        loader = self._create_loader()
+        # Capacity gate: at most two adapters resident at once.
+        self.mock_lora_manager.validate_lora_batch.side_effect = (
+            lambda lora_ids: len(lora_ids) <= 2
+        )
+
+        running: set = set()
+        admitted = []
+        for lora_id in ("lora_A", "lora_B", "lora_C"):
+            if loader.try_admit_overlap_lora(lora_id, running):
+                admitted.append(lora_id)
+                running.add(lora_id)
+
+        # Exactly two admitted; the third rejected.
+        self.assertEqual(admitted, ["lora_A", "lora_B"])
+        self.assertNotIn("lora_C", running)
+        # Admission never touches transfer state.
+        self.mock_lora_manager.fetch_new_loras.assert_not_called()
+        self.assertEqual(len(loader.lora_to_overlap_load_event), 0)
+        self.assertEqual(len(loader.pipelined_loading_loras), 0)
+
+        # Flush loads only the admitted subset.
+        loader.new_overlap_loads_lora(set(admitted))
+        self.mock_lora_manager.fetch_new_loras.assert_called_once()
+        self.assertEqual(
+            self.mock_lora_manager.fetch_new_loras.call_args[0][0],
+            {"lora_A", "lora_B"},
+        )
+        self.assertNotIn("lora_C", loader.pipelined_loading_loras)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")

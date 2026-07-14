@@ -756,21 +756,116 @@ class LoRAMemoryPool:
         for uid in cur_uids:
             self.eviction_policy.mark_used(uid)
 
-        for uid in cur_uids:
-            if uid not in self.uid_to_buffer_id:
-                buffer_id = get_available_buffer_slot()
-                lora_adapter = lora_adapters.get(uid, None)
+        new_uids = [uid for uid in cur_uids if uid not in self.uid_to_buffer_id]
+        if not new_uids:
+            return
+
+        # Resolve buffer slots for the whole incoming set up front so eviction
+        slots: Dict[Optional[str], int] = {}
+        for uid in new_uids:
+            buffer_id = get_available_buffer_slot()
+            slots[uid] = buffer_id
+            self.buffer_id_to_uid[buffer_id] = uid
+
+        if loading_stream is not None:
+            # Pipelined load: always go layer-major (interleave adapters within
+            # each layer so a layer's shared pipeline flag flips ready only once
+            # every adapter's weights for that layer have landed). A single new
+            # adapter is just the one-iteration case of the same loop, so it
+            # takes this path too — that keeps one set of flag semantics for the
+            # pipelined case, including the base-model (`uid is None`) zero-fill
+            # which is then wrapped by the per-layer flag rather than skipping it.
+            self._load_batch_per_layer(
+                new_uids,
+                slots,
+                lora_adapters,
+                lora_modules,
+                lora_embed_tokens_module,
+                lora_lm_head_module,
+                loading_stream,
+            )
+        else:
+            # Non-pipelined forward path (no loading stream to signal per-layer
+            # flags against): load each new adapter's full weights directly.
+            for uid in new_uids:
                 self.load_lora_weight_to_buffer(
                     uid,
-                    buffer_id,
-                    lora_adapter,
+                    slots[uid],
+                    lora_adapters.get(uid, None),
+                    lora_modules,
+                    lora_embed_tokens_module,
+                    lora_lm_head_module,
+                )
+
+        for uid in new_uids:
+            self.uid_to_buffer_id[uid] = slots[uid]
+
+    def _load_batch_per_layer(
+        self,
+        new_uids: List[Optional[str]],
+        slots: Dict[Optional[str], int],
+        lora_adapters: Dict[str, LoRAAdapter],
+        lora_modules: List[Dict[str, BaseLayerWithLoRA]],
+        lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
+        lora_lm_head_module: Optional[BaseLayerWithLoRA],
+        loading_stream: torch.cuda.Stream,
+    ):
+        """Load several new adapters layer-major over a single loading stream."""
+        # Pre-validate every adapter once before any buffer is mutated, matching
+        # the single-adapter contract (mismatches raise before GPU writes).
+        for uid in new_uids:
+            if uid is not None:
+                self._prevalidate_adapter_weights(uid, lora_adapters[uid])
+
+        for layer_id in range(self.num_layer):
+            layer_flag = self._get_layer_pipeline_flag(lora_modules[layer_id])
+            if layer_flag is not None:
+                layer_flag.mark_loading()
+            for uid in new_uids:
+                self.load_lora_weight_to_buffer(
+                    uid,
+                    slots[uid],
+                    lora_adapters.get(uid, None),
                     lora_modules,
                     lora_embed_tokens_module,
                     lora_lm_head_module,
                     loading_stream=loading_stream,
+                    layers_to_load=(layer_id,),
+                    run_prevalidation=False,
+                    load_embeddings=False,
+                    signal_layer_flags=False,
                 )
-                self.uid_to_buffer_id[uid] = buffer_id
-                self.buffer_id_to_uid[buffer_id] = uid
+            if layer_flag is not None:
+                layer_flag.mark_ready(loading_stream)
+
+        # embed_tokens / lm_head: load every adapter's embeddings, then signal
+        # their shared flags once (they carry their own flags, not layer flags).
+        self._signal_embedding_flags(
+            lora_embed_tokens_module,
+            lora_lm_head_module,
+            mark_ready=False,
+            loading_stream=loading_stream,
+        )
+        for uid in new_uids:
+            self.load_lora_weight_to_buffer(
+                uid,
+                slots[uid],
+                lora_adapters.get(uid, None),
+                lora_modules,
+                lora_embed_tokens_module,
+                lora_lm_head_module,
+                loading_stream=loading_stream,
+                layers_to_load=(),
+                run_prevalidation=False,
+                load_embeddings=True,
+                signal_layer_flags=False,
+            )
+        self._signal_embedding_flags(
+            lora_embed_tokens_module,
+            lora_lm_head_module,
+            mark_ready=True,
+            loading_stream=loading_stream,
+        )
 
     def load_lora_weight_to_buffer(
         self,
@@ -781,6 +876,10 @@ class LoRAMemoryPool:
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
         loading_stream: Optional[torch.cuda.Stream] = None,
+        layers_to_load: Optional[Iterable[int]] = None,
+        run_prevalidation: bool = True,
+        load_embeddings: bool = True,
+        signal_layer_flags: bool = True,
     ):
         """
         Load LoRA weights into the buffer slot.
@@ -790,6 +889,10 @@ class LoRAMemoryPool:
         can overlap with weight loading.
         """
         pipelined = loading_stream is not None
+        signal_flags = pipelined and signal_layer_flags
+        layer_ids = (
+            range(self.num_layer) if layers_to_load is None else layers_to_load
+        )
 
         def load_lora_weight_tensor(
             buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
@@ -821,61 +924,29 @@ class LoRAMemoryPool:
             return weight, key
 
         if uid is None:
-            for i in range(self.num_layer):
+            for i in layer_ids:
                 for k in self.A_buffer.keys():
                     self.A_buffer[k][i][buffer_id] = 0
 
-            for k in self.embedding_A_buffer.keys():
-                self.embedding_A_buffer[k][buffer_id] = 0
+            if load_embeddings:
+                for k in self.embedding_A_buffer.keys():
+                    self.embedding_A_buffer[k][buffer_id] = 0
 
-            for k in self.lm_head_A_buffer.keys():
-                self.lm_head_A_buffer[k][buffer_id] = 0
+                for k in self.lm_head_A_buffer.keys():
+                    self.lm_head_A_buffer[k][buffer_id] = 0
             return
 
         assert lora_adapter is not None
 
         lora_rank = lora_adapter.config.r
 
-        # Pre-validate weight names against target modules across all layers
-        # and embedding weights.  This catches mismatches before any GPU
-        # buffers are mutated.
-        skipped_weight_names: set = set()
-        matched_modules: set = set()
-        all_weight_names: list = []
-        for layer in lora_adapter.layers:
-            all_weight_names.extend(layer.weights.keys())
-        if lora_adapter.embedding_layers:
-            all_weight_names.extend(lora_adapter.embedding_layers.keys())
-        for name in all_weight_names:
-            try:
-                target_module = get_target_module_name(name, self.target_modules)
-                matched_modules.add(target_module)
-            except ValueError:
-                skipped_weight_names.add(name)
-        if matched_modules:
-            logger.info(
-                "LoRA adapter '%s': loaded weights for target modules %s.",
-                uid,
-                sorted(matched_modules),
-            )
-        if skipped_weight_names:
-            msg = (
-                f"LoRA adapter '{uid}': {len(skipped_weight_names)} weight(s) "
-                f"skipped because they did not match any target module in "
-                f"{sorted(self.target_modules)}. Skipped weights: "
-                f"{sorted(skipped_weight_names)}. This likely indicates a "
-                f"mismatch between the adapter's target modules and the base "
-                f"model architecture."
-            )
-            if self.strict_loading:
-                raise ValueError(msg)
-            else:
-                logger.warning(msg)
+        if run_prevalidation:
+            self._prevalidate_adapter_weights(uid, lora_adapter)
 
-        for layer_id in range(self.num_layer):
+        for layer_id in layer_ids:
             # Signal this layer's shared flag as LOADING before DMA.
             # All modules in a layer share one flag, so we only signal once.
-            if pipelined:
+            if signal_flags:
                 layer_flag = self._get_layer_pipeline_flag(lora_modules[layer_id])
                 if layer_flag is not None:
                     layer_flag.mark_loading()
@@ -1238,23 +1309,22 @@ class LoRAMemoryPool:
                         target_buffer[buffer_id, :, lora_rank:].zero_()
 
             # Signal this layer's shared flag as READY after DMA
-            if pipelined:
+            if signal_flags:
                 layer_flag = self._get_layer_pipeline_flag(lora_modules[layer_id])
                 if layer_flag is not None:
                     layer_flag.mark_ready(loading_stream)
 
+        if not load_embeddings:
+            return
+
         # Signal embed_tokens and lm_head as LOADING before embedding DMA
-        if pipelined:
-            if (
-                lora_embed_tokens_module is not None
-                and lora_embed_tokens_module._pipeline_flag is not None
-            ):
-                lora_embed_tokens_module._pipeline_flag.mark_loading()
-            if (
-                lora_lm_head_module is not None
-                and lora_lm_head_module._pipeline_flag is not None
-            ):
-                lora_lm_head_module._pipeline_flag.mark_loading()
+        if signal_flags:
+            self._signal_embedding_flags(
+                lora_embed_tokens_module,
+                lora_lm_head_module,
+                mark_ready=False,
+                loading_stream=loading_stream,
+            )
 
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size
@@ -1399,17 +1469,67 @@ class LoRAMemoryPool:
                 self.new_embeddings_buffer["input_embeddings"][buffer_id].zero_()
 
         # Signal embed_tokens and lm_head as READY after embedding DMA
-        if pipelined:
-            if (
-                lora_embed_tokens_module is not None
-                and lora_embed_tokens_module._pipeline_flag is not None
-            ):
-                lora_embed_tokens_module._pipeline_flag.mark_ready(loading_stream)
-            if (
-                lora_lm_head_module is not None
-                and lora_lm_head_module._pipeline_flag is not None
-            ):
-                lora_lm_head_module._pipeline_flag.mark_ready(loading_stream)
+        if signal_flags:
+            self._signal_embedding_flags(
+                lora_embed_tokens_module,
+                lora_lm_head_module,
+                mark_ready=True,
+                loading_stream=loading_stream,
+            )
+
+    @staticmethod
+    def _signal_embedding_flags(
+        lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
+        lora_lm_head_module: Optional[BaseLayerWithLoRA],
+        mark_ready: bool,
+        loading_stream: torch.cuda.Stream,
+    ) -> None:
+        """Fire the embed_tokens / lm_head pipeline flags (loading or ready)."""
+        for module in (lora_embed_tokens_module, lora_lm_head_module):
+            if module is not None and module._pipeline_flag is not None:
+                if mark_ready:
+                    module._pipeline_flag.mark_ready(loading_stream)
+                else:
+                    module._pipeline_flag.mark_loading()
+
+    def _prevalidate_adapter_weights(
+        self, uid: str, lora_adapter: LoRAAdapter
+    ) -> None:
+        """Pre-validate weight names against target modules across all layers and
+        embedding weights. This catches mismatches before any GPU buffers are
+        mutated. Pure validation/logging — no buffer writes."""
+        skipped_weight_names: set = set()
+        matched_modules: set = set()
+        all_weight_names: list = []
+        for layer in lora_adapter.layers:
+            all_weight_names.extend(layer.weights.keys())
+        if lora_adapter.embedding_layers:
+            all_weight_names.extend(lora_adapter.embedding_layers.keys())
+        for name in all_weight_names:
+            try:
+                target_module = get_target_module_name(name, self.target_modules)
+                matched_modules.add(target_module)
+            except ValueError:
+                skipped_weight_names.add(name)
+        if matched_modules:
+            logger.info(
+                "LoRA adapter '%s': loaded weights for target modules %s.",
+                uid,
+                sorted(matched_modules),
+            )
+        if skipped_weight_names:
+            msg = (
+                f"LoRA adapter '{uid}': {len(skipped_weight_names)} weight(s) "
+                f"skipped because they did not match any target module in "
+                f"{sorted(self.target_modules)}. Skipped weights: "
+                f"{sorted(skipped_weight_names)}. This likely indicates a "
+                f"mismatch between the adapter's target modules and the base "
+                f"model architecture."
+            )
+            if self.strict_loading:
+                raise ValueError(msg)
+            else:
+                logger.warning(msg)
 
     def get_embedding_tensor(
         self, target_module: str, lora_type: LoRAType

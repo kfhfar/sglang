@@ -30,17 +30,19 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd")
 
-# Two adapters on a freely available base model
+# Adapters on a freely available base model
 LORA_A = "algoprog/fact-generation-llama-3.1-8b-instruct-lora"
 LORA_B = "nvidia/llama-3.1-nemoguard-8b-topic-control"
+LORA_C = "philschmid/code-llama-3-1-8b-text-to-sql-lora"
 BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
 PROMPT_1 = "AI is a field of computer science focused on"
 PROMPT_2 = "The capital of France is"
+PROMPT_3 = "SELECT name FROM users WHERE"
 
 
 class TestLoRAOverlapLoadingSingleRequest(CustomTestCase):
-    """1. Single request, single LoRA loading with max 1 LoRA in GPU."""
+    """Single request, single LoRA loading with max 1 LoRA in GPU."""
 
     def test_single_request_single_lora(self):
         model_case = LoRAModelCase(
@@ -63,36 +65,35 @@ class TestLoRAOverlapLoadingSingleRequest(CustomTestCase):
 
 
 class TestLoRAOverlapLoadingBatchReplace(CustomTestCase):
-    """2. Two new LoRAs replace two in GPU, batch runs with correct output."""
+    """Multiple new LoRAs admitted in one batch run with correct output."""
 
-    def test_two_loras_batch_replace(self):
+    def test_three_loras_batch_replace(self):
         with SRTRunner(
             BASE_MODEL,
             torch_dtype=torch.float16,
             model_type="generation",
-            lora_paths=[LORA_A, LORA_B],
+            lora_paths=[LORA_A, LORA_B, LORA_C],
             enable_lora_overlap_loading=True,
-            max_loras_per_batch=2,
-            max_loaded_loras=2,
+            max_loras_per_batch=3,
+            max_loaded_loras=3,
             disable_cuda_graph=True,
             disable_radix_cache=True,
             sleep_on_idle=True,
         ) as srt_runner:
-            # Batch with both LoRAs
+            # Single batch introducing all three new adapters at once.
             outputs = srt_runner.batch_forward(
-                [PROMPT_1, PROMPT_2],
+                [PROMPT_1, PROMPT_2, PROMPT_3],
                 max_new_tokens=32,
-                lora_paths=[LORA_A, LORA_B],
+                lora_paths=[LORA_A, LORA_B, LORA_C],
             )
-            # Different adapters should produce different outputs
-            self.assertNotEqual(
-                outputs.output_strs[0].strip(),
-                outputs.output_strs[1].strip(),
-                "Two different LoRA adapters produced identical output",
-            )
-            # Both should produce non-empty output
-            self.assertTrue(len(outputs.output_strs[0].strip()) > 0)
-            self.assertTrue(len(outputs.output_strs[1].strip()) > 0)
+            strs = [s.strip() for s in outputs.output_strs]
+            # All three should produce non-empty output.
+            for s in strs:
+                self.assertTrue(len(s) > 0)
+            # Distinct adapters should produce pairwise-distinct outputs.
+            self.assertNotEqual(strs[0], strs[1])
+            self.assertNotEqual(strs[0], strs[2])
+            self.assertNotEqual(strs[1], strs[2])
 
 
 class TestLoRAOverlapLoadingEviction(CustomTestCase):

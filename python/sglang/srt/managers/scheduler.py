@@ -2907,6 +2907,17 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
+        if self.enable_lora and self.enable_lora_overlap_loading:
+            # All new adapters for this batch are now known; issue their weight
+            # transfers as one layer-major load (see `_can_schedule_lora_req`).
+            batch_loras = {req.lora_id for req in can_run_list}
+            batch_loras.update(
+                req.lora_id
+                for req in self.running_batch.reqs
+                if not req.finished()
+            )
+            self.lora_overlap_loader.new_overlap_loads_lora(batch_loras)
+
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
@@ -3005,9 +3016,8 @@ class Scheduler(
             return True
 
         if self.enable_lora_overlap_loading:
-            # For overlapping loading of LoRA weights with computation, we will load each
-            # adapter one at a time, as opposed to loading them in one batch
-            return self.lora_overlap_loader.try_overlap_load_lora(
+            # Admit the adapter into the batch now (capacity check only)
+            return self.lora_overlap_loader.try_admit_overlap_lora(
                 req.lora_id, running_loras
             )
         else:
